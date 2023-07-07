@@ -30,6 +30,7 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
 
     file
     |> write_overview(swagger)
+    |> write_intro(path)
     |> write_authentication(swagger)
     |> write_models(swagger)
 
@@ -61,6 +62,33 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
 
     #{info["description"]}
     """)
+  end
+
+  @doc """
+  Writes any information included in an intro file at the top of the output
+  document.
+  """
+  def write_intro(file, path) do
+    intro_file_path =
+      [
+        # /path/to/API.md -> /path/to/API_INTRO.md
+        String.replace(path, ~r/\.md$/i, "_INTRO\\0"),
+        # /path/to/api.md -> /path/to/api_intro.md
+        String.replace(path, ~r/\.md$/i, "_intro\\0"),
+        # /path/to/API -> /path/to/API_INTRO
+        "#{path}_INTRO",
+        # /path/to/api -> /path/to/api_intro
+        "#{path}_intro"
+      ]
+      # which one exists?
+      |> Enum.find(nil, &File.exists?/1)
+
+    if intro_file_path do
+      file
+      |> puts(File.read!(intro_file_path))
+    else
+      file
+    end
   end
 
   @doc """
