@@ -141,7 +141,7 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   """
   def write_model_properties(file, swagger, model_schema, prefix \\ "") do
     {objects, primitives} =
-      model_schema["properties"]
+      Map.get(model_schema, "properties", [])
       |> Enum.split_with(fn {_key, schema} -> schema["type"] == "object" end)
 
     ordered = Enum.concat(primitives, objects)
@@ -233,7 +233,7 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   records_by_operation_id are the examples collected during tests, grouped by operationId (Controller.action)
   """
   def write_operations_for_tag(file, tag, records_by_operation_id, swagger) do
-    tag_details = swagger["tags"] |> Enum.find(&(&1["name"] == tag))
+    tag_details = Map.get(swagger, "tags", []) |> Enum.find(&(&1["name"] == tag))
 
     file
     |> puts("# #{tag}\n")
