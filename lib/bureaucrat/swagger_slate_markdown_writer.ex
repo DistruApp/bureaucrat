@@ -40,6 +40,8 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     |> Enum.each(fn {tag, records_by_operation_id} ->
       write_operations_for_tag(file, tag, records_by_operation_id, swagger)
     end)
+
+    write_change_logs(file, path)
   end
 
   @doc """
@@ -86,6 +88,32 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     if intro_file_path do
       file
       |> puts(File.read!(intro_file_path))
+    else
+      file
+    end
+  end
+
+  def write_change_logs(file, path) do
+    change_log_file_path =
+      [
+        # /path/to/API.md -> /path/to/API_CHANGE_LOGS.md
+        String.replace(path, ~r/\.md$/i, "_CHANGE_LOGS\\0"),
+        # /path/to/api.md -> /path/to/api_CHANGE_LOGS.md
+        String.replace(path, ~r/\.md$/i, "_change_logs\\0"),
+        # /path/to/API -> /path/to/API_CHANGE_LOGS
+        "#{path}_CHANGE_LOGS",
+        # /path/to/api -> /path/to/api_CHANGE_LOGS
+        "#{path}_change_logs"
+      ]
+      # which one exists?
+      |> Enum.find(nil, &File.exists?/1)
+
+    if change_log_file_path do
+      file
+      |> puts("""
+      # Change Logs
+      """)  
+      |> puts(File.read!(change_log_file_path))
     else
       file
     end
@@ -177,7 +205,15 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     Enum.each(ordered, fn {property, property_details} ->
       {property_details, type} = resolve_type(swagger, property_details)
       required? = is_required(property, model_schema)
-      write_model_property(file, swagger, "#{prefix}#{property}", property_details, type, required?)
+
+      write_model_property(
+        file,
+        swagger,
+        "#{prefix}#{property}",
+        property_details,
+        type,
+        required?
+      )
     end)
 
     file
@@ -203,7 +239,10 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
 
     # TODO: handle arrays with inline schema
     schema_ref = if schema != nil, do: schema["$ref"], else: nil
-    type = if schema_ref != nil, do: "array(#{schema_ref_to_link(schema_ref)})", else: "array(any)"
+
+    type =
+      if schema_ref != nil, do: "array(#{schema_ref_to_link(schema_ref)})", else: "array(any)"
+
     write_model_property(file, swagger, property, property_details, type, required?)
   end
 
@@ -249,7 +288,9 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     by_tag = Enum.group_by(records, & &1.private.swagger_tag)
 
     Enum.map(by_tag, fn {tag, records_with_tag} ->
-      by_operation_id = Enum.group_by(records_with_tag, & &1.assigns.bureaucrat_opts[:operation_id])
+      by_operation_id =
+        Enum.group_by(records_with_tag, & &1.assigns.bureaucrat_opts[:operation_id])
+
       {tag, by_operation_id}
     end)
   end
@@ -322,7 +363,8 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   Uses the vendor extension "x-example" to provide example of each parameter.
   TODO: detailed schema validation rules aren't shown yet (min/max/regex/etc...)
   """
-  def write_parameters(file, swagger, _ = %{"parameters" => params}) when length(params) > 0 or map_size(params) > 0 do
+  def write_parameters(file, swagger, _ = %{"parameters" => params})
+      when length(params) > 0 or map_size(params) > 0 do
     file
     |> puts("### Parameters\n")
     |> puts("| Parameter   | Description | In |Type      | Required | Default | Example |")
@@ -353,7 +395,9 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   def resolve_schema_type(_swagger, param), do: param
 
   # Encode parameter table cell values as strings, using json library to convert lists/maps
-  defp encode_parameter_table_cell(param) when is_map(param) or is_list(param), do: JSON.encode!(param)
+  defp encode_parameter_table_cell(param) when is_map(param) or is_list(param),
+    do: JSON.encode!(param)
+
   defp encode_parameter_table_cell(param), do: to_string(param)
 
   @doc """
