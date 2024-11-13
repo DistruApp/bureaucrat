@@ -111,6 +111,7 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     if change_log_file_path do
       file
       |> puts("""
+      
       # Changelog
       """)  
       |> puts(File.read!(change_log_file_path))
