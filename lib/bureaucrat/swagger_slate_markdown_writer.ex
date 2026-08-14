@@ -32,16 +32,9 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     |> write_overview(swagger)
     |> write_intro(path)
     |> write_authentication(swagger)
+    |> write_endpoints(records, swagger)
     |> write_models(swagger)
-
-    records
-    |> tag_records(swagger)
-    |> group_records()
-    |> Enum.each(fn {tag, records_by_operation_id} ->
-      write_operations_for_tag(file, tag, records_by_operation_id, swagger)
-    end)
-
-    write_change_logs(file, path)
+    |> write_change_logs(path)
   end
 
   @doc """
@@ -111,12 +104,43 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     if change_log_file_path do
       file
       |> puts("""
-      
+
       # Changelog
-      """)  
-      |> puts(File.read!(change_log_file_path))
+      """)
+      |> puts(sort_change_logs(File.read!(change_log_file_path)))
     else
       file
+    end
+  end
+
+  @doc """
+  Sorts changelog entries by date descending so the newest changes appear first.
+
+  Each entry is a `## <date>` section. Entries whose heading isn't an ISO-8601
+  date keep their relative order and are appended after the dated ones.
+  """
+  def sort_change_logs(content) do
+    {dated, undated} =
+      content
+      |> String.split(~r/^(?=## )/m, trim: true)
+      |> Enum.map(fn section -> {change_log_date(section), String.trim_trailing(section)} end)
+      |> Enum.split_with(fn {date, _section} -> date != nil end)
+
+    dated_sections =
+      dated
+      |> Enum.sort_by(fn {date, _section} -> date end, {:desc, Date})
+      |> Enum.map(fn {_date, section} -> section end)
+
+    (dated_sections ++ Enum.map(undated, fn {_date, section} -> section end))
+    |> Enum.join("\n\n")
+  end
+
+  defp change_log_date(section) do
+    with [_, heading] <- Regex.run(~r/^##\s+(\S+)/, section),
+         {:ok, date} <- Date.from_iso8601(heading) do
+      date
+    else
+      _ -> nil
     end
   end
 
@@ -154,7 +178,9 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   def write_models(file, swagger) do
     puts(file, "# Models\n")
 
-    Enum.each(swagger["definitions"], fn definition ->
+    swagger["definitions"]
+    |> Enum.sort_by(fn {name, _schema} -> name end)
+    |> Enum.each(fn definition ->
       write_model(file, swagger, definition)
     end)
 
@@ -282,46 +308,75 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     Conn.put_private(conn, :swagger_tag, tags_by_operation_id[operation_id])
   end
 
+  # Report operations are pulled out of their individual swagger tags and
+  # consolidated under a single "Reports" menu section.
+  @reports_path_prefix "/public/v1/reports/"
+  @reports_section "Reports"
+
   @doc """
-  Group a list of tagged records, first by tag, then by operation_id.
+  Writes every API operation under a single top-level "Endpoints" section.
+
+  Operations are grouped into menu sections (the swagger tag, or "Reports" for
+  report endpoints), then rendered as `## Section` (h2) with each operation as
+  `### Summary` (h3). Sections and operations are sorted alphabetically so the
+  generated Slate navigation is alphabetical.
   """
-  def group_records(records) do
-    by_tag = Enum.group_by(records, & &1.private.swagger_tag)
+  def write_endpoints(file, records, swagger) do
+    puts(file, "# Endpoints\n")
 
-    Enum.map(by_tag, fn {tag, records_with_tag} ->
-      by_operation_id =
-        Enum.group_by(records_with_tag, & &1.assigns.bureaucrat_opts[:operation_id])
+    records
+    |> tag_records(swagger)
+    |> group_into_sections(swagger)
+    |> Enum.each(fn {section, operations} ->
+      puts(file, "## #{section}\n")
 
-      {tag, by_operation_id}
+      Enum.each(operations, fn {details, operation_records} ->
+        write_action(file, details, operation_records, swagger)
+      end)
     end)
+
+    file
   end
 
   @doc """
-  Writes the API details and exampels for operations having the given tag.
+  Groups tagged records into alphabetically sorted menu sections.
 
-  tag roughly corresponds to a phoenix controller, eg "Users"
-  records_by_operation_id are the examples collected during tests, grouped by operationId (Controller.action)
+  Returns `[{section, operations}]` sorted by section, where operations is
+  `[{operation_details, records}]` sorted by summary. Report endpoints are
+  collected under the "Reports" section regardless of their swagger tag.
   """
-  def write_operations_for_tag(file, tag, records_by_operation_id, swagger) do
-    tag_details = Map.get(swagger, "tags", []) |> Enum.find(&(&1["name"] == tag))
-
-    file
-    |> puts("# #{tag}\n")
-    |> puts("#{tag_details["description"]}\n")
-
-    Enum.each(records_by_operation_id, fn {operation_id, records} ->
-      write_action(file, operation_id, records, swagger)
+  def group_into_sections(records, swagger) do
+    records
+    |> Enum.group_by(& &1.assigns.bureaucrat_opts[:operation_id])
+    |> Enum.map(fn {operation_id, operation_records} ->
+      details = find_operation_by_id(swagger, operation_id)
+      {section_for(details, operation_records), details, operation_records}
     end)
+    |> Enum.group_by(fn {section, _details, _records} -> section end)
+    |> Enum.map(fn {section, operations} ->
+      sorted =
+        operations
+        |> Enum.map(fn {_section, details, records} -> {details, records} end)
+        |> Enum.sort_by(fn {details, _records} -> details["summary"] end)
 
-    file
+      {section, sorted}
+    end)
+    |> Enum.sort_by(fn {section, _operations} -> section end)
+  end
+
+  defp section_for(details, records) do
+    if String.starts_with?(to_string(details["path"]), @reports_path_prefix) do
+      @reports_section
+    else
+      List.first(records).private.swagger_tag
+    end
   end
 
   @doc """
   Writes all examples of a given operation (Controller action) to file.
   """
-  def write_action(file, operation_id, records, swagger) do
-    details = find_operation_by_id(swagger, operation_id)
-    puts(file, "## #{details["summary"]}\n")
+  def write_action(file, details, records, swagger) do
+    puts(file, "### #{details["summary"]}\n")
 
     # write examples before params/schemas to get correct alignment in slate
     Enum.each(records, &write_example(file, &1))
@@ -354,7 +409,7 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   """
   def write_request(file, %{"action" => action, "path" => path}) do
     file
-    |> puts("### Request\n")
+    |> puts("#### Request\n")
     |> puts("`#{String.upcase(action)} #{path}`")
   end
 
@@ -367,7 +422,7 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   def write_parameters(file, swagger, _ = %{"parameters" => params})
       when length(params) > 0 or map_size(params) > 0 do
     file
-    |> puts("### Parameters\n")
+    |> puts("#### Parameters\n")
     |> puts("| Parameter   | Description | In |Type      | Required | Default | Example |")
     |> puts("|-------------|-------------|----|----------|----------|---------|---------|")
 
@@ -410,7 +465,7 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   """
   def write_responses(file, swagger_operation) do
     file
-    |> puts("### Responses\n")
+    |> puts("#### Responses\n")
     |> puts("| Status | Description | Schema |")
     |> puts("|--------|-------------|--------|")
 
