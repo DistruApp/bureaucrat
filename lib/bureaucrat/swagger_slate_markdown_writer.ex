@@ -190,31 +190,24 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   @doc """
   Writes a single API model schema to the given file.
 
-  Most of the work is delegated to the write_model_properties/3 recurive function.
-  The example json is output before the table just so slate will align them.
+  Most of the work is delegated to the write_model_properties/3 recursive function.
+  A unique `model-<name>` anchor is emitted as an empty block-level `<div id>`
+  just before the heading so in-doc links resolve to the model rather than to the
+  identically named Endpoints section (Slate slugifies both `## <Name>` headings
+  to the same id, and the first one wins). A block `<div>` is used (not an inline
+  `<a>`): Redcarpet merges an inline anchor into the following heading, and the
+  Slate TOC helper then clones that heading's inner-HTML into the nav, producing a
+  duplicate anchor whose nav copy hijacks the link.
   """
   def write_model(file, swagger, {name, model_schema}) do
     file
+    |> puts(~s(<div id="#{model_anchor(name)}"></div>\n))
     |> puts("## #{name}\n")
-    |> puts("#{model_schema["description"]}")
-    |> write_model_example(model_schema)
+    |> puts("#{model_schema["description"]}\n")
     |> puts("|Property|Description|Type|Required|")
     |> puts("|--------|-----------|----|--------|")
     |> write_model_properties(swagger, model_schema)
     |> puts("")
-  end
-
-  def write_model_example(file, %{"example" => example}) do
-    json = JSON.encode!(example, pretty: true)
-
-    file
-    |> puts("\n```json")
-    |> puts(json)
-    |> puts("```\n")
-  end
-
-  def write_model_example(file, _) do
-    puts(file, "")
   end
 
   @doc """
@@ -223,11 +216,9 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   prefix is output before each property name to enable nested objects to be flattened.
   """
   def write_model_properties(file, swagger, model_schema, prefix \\ "") do
-    {objects, primitives} =
+    ordered =
       Map.get(model_schema, "properties", [])
-      |> Enum.split_with(fn {_key, schema} -> schema["type"] == "object" end)
-
-    ordered = Enum.concat(primitives, objects)
+      |> Enum.sort_by(fn {key, _schema} -> key end)
 
     Enum.each(ordered, fn {property, property_details} ->
       {property_details, type} = resolve_type(swagger, property_details)
@@ -282,8 +273,13 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
 
   # Convert a schema reference eg, #/definitions/User to a markdown link
   def schema_ref_to_link("#/definitions/" <> type) do
-    "[#{type}](##{String.downcase(type)})"
+    "[#{type}](##{model_anchor(type)})"
   end
+
+  # Anchor for a model's Models-section heading. Kept unique (prefixed with
+  # `model-`) so links don't resolve to a same-named Endpoints section heading,
+  # which Slate would otherwise slugify to the same id and win.
+  def model_anchor(name), do: "model-#{String.downcase(name)}"
 
   @doc """
   Populate each test record with private.swagger_tag and private.operation_id from swagger.
@@ -378,14 +374,28 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   def write_action(file, details, records, swagger) do
     puts(file, "### #{details["summary"]}\n")
 
-    # write examples before params/schemas to get correct alignment in slate
-    Enum.each(records, &write_example(file, &1))
+    # write the example before params/schemas to get correct alignment in slate
+    case representative_record(records) do
+      nil -> file
+      record -> write_example(file, record)
+    end
 
     file
     |> puts("#{details["description"]}\n")
     |> write_request(details)
     |> write_parameters(swagger, details)
     |> write_responses(details)
+  end
+
+  # A single example is rendered per operation. Prefer a 2xx response and, among
+  # those, the one with the largest body (most fields populated); fall back to
+  # the first record. Tests should record just one example per operation anyway.
+  def representative_record([]), do: nil
+
+  def representative_record(records) do
+    successes = Enum.filter(records, fn record -> record.status in 200..299 end)
+    candidates = if successes == [], do: records, else: successes
+    Enum.max_by(candidates, fn record -> byte_size(record.resp_body || "") end)
   end
 
   @doc """
@@ -426,7 +436,7 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     |> puts("| Parameter   | Description | In |Type      | Required | Default | Example |")
     |> puts("|-------------|-------------|----|----------|----------|---------|---------|")
 
-    Enum.each(params, fn param ->
+    Enum.each(Enum.sort_by(params, & &1["name"]), fn param ->
       enriched_param = resolve_schema_type(swagger, param)
 
       content =
@@ -501,7 +511,7 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     unless record.body_params == %{} do
       file
       |> puts("```json")
-      |> puts("#{JSON.encode!(record.body_params, pretty: true)}")
+      |> puts("#{JSON.encode!(deep_sort_json(record.body_params), pretty: true)}")
       |> puts("```\n")
     end
 
@@ -541,9 +551,30 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   def format_resp_body(string) do
     case string do
       "" -> ""
-      _ -> string |> JSON.decode!() |> JSON.encode!(pretty: true)
+      _ -> string |> JSON.decode!() |> deep_sort_json() |> JSON.encode!(pretty: true)
     end
   end
+
+  @doc """
+  Recursively sorts object keys so rendered JSON examples are alphabetical.
+
+  Maps become `Jason.OrderedObject`s (the configured JSON library is Jason) to
+  preserve key order through encoding; lists are mapped element-wise.
+  """
+  # Only plain JSON objects get key-sorted. Structs (e.g. Plug.Upload in a
+  # file-upload body) pass through untouched so their own Jason encoder is used,
+  # matching how the body was encoded before sorting was introduced.
+  def deep_sort_json(%_{} = struct), do: struct
+
+  def deep_sort_json(map) when is_map(map) do
+    map
+    |> Enum.sort_by(fn {key, _value} -> to_string(key) end)
+    |> Enum.map(fn {key, value} -> {key, deep_sort_json(value)} end)
+    |> Jason.OrderedObject.new()
+  end
+
+  def deep_sort_json(list) when is_list(list), do: Enum.map(list, &deep_sort_json/1)
+  def deep_sort_json(value), do: value
 
   defp config, do: Application.get_env(:bureaucrat, :writer_opts, [])
 end
