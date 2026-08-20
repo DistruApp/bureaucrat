@@ -265,7 +265,8 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   end
 
   def write_model_property(file, _swagger, property, property_details, type, required?) do
-    puts(file, "|#{property}|#{property_details["description"]}|#{type}|#{required?}|")
+    description = "#{format_description(property_details["description"])}#{enum_badges(property_details)}"
+    puts(file, "|#{property}|#{description}|#{type}|#{required?}|")
   end
 
   defp is_required(property, %{"required" => required}), do: property in required
@@ -437,7 +438,12 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     |> puts("|-------------|-------------|----|----------|----------|---------|---------|")
 
     Enum.each(Enum.sort_by(params, & &1["name"]), fn param ->
-      enriched_param = resolve_schema_type(swagger, param)
+      badges = enum_badges(param)
+
+      enriched_param =
+        swagger
+        |> resolve_schema_type(param)
+        |> Map.update("description", badges, &"#{format_description(&1)}#{badges}")
 
       content =
         ["name", "description", "in", "type", "required", "default", "x-example"]
@@ -465,6 +471,43 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     do: JSON.encode!(param)
 
   defp encode_parameter_table_cell(param), do: to_string(param)
+
+  # A description may enumerate allowed values as bullets, each prefixed with "• "
+  # (see the public API swagger schemas). Render those as a real HTML `<ul>` list
+  # so they display as bullets instead of one run-on line; a table cell can't hold
+  # Markdown list syntax, so raw HTML is the only option. Text before the first
+  # bullet (intro) is emitted as-is before the list. Any `<br>` separators around
+  # the bullets are dropped — the list markup provides the line breaks.
+  defp format_description(nil), do: ""
+
+  defp format_description(description) do
+    if String.contains?(description, "•") do
+      [intro | items] =
+        description
+        |> String.replace("<br>", "")
+        |> String.split("•")
+
+      list = Enum.map_join(items, &"<li>#{String.trim(&1)}</li>")
+
+      "#{String.trim_trailing(intro)}<ul>#{list}</ul>"
+    else
+      description
+    end
+  end
+
+  # Render a field's allowed enum values as inline badges under its description.
+  # Enum values live directly on the field (query params, model properties), on its
+  # array `items` (array fields), or on its `schema` (body params).
+  defp enum_badges(details) do
+    values =
+      details["enum"] || get_in(details, ["items", "enum"]) ||
+        get_in(details, ["schema", "enum"]) || get_in(details, ["schema", "items", "enum"])
+
+    case values do
+      nil -> ""
+      values -> "<br>" <> Enum.map_join(values, " ", &~s(<span class="enum-badge">#{&1}</span>))
+    end
+  end
 
   @doc """
   Writes the responses table for given swagger operation to file.
