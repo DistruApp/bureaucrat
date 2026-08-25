@@ -375,11 +375,15 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   def write_action(file, details, records, swagger) do
     puts(file, "### #{details["summary"]}\n")
 
-    # write the example before params/schemas to get correct alignment in slate
+    # write the example(s) before params/schemas to get correct alignment in slate.
+    # One success example (request + response), then each `response_only` error
+    # example (response only), in source order.
     case representative_record(records) do
       nil -> file
       record -> write_example(file, record)
     end
+
+    Enum.each(error_records(records), &write_example(file, &1))
 
     file
     |> puts("#{details["description"]}\n")
@@ -388,15 +392,35 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     |> write_responses(details)
   end
 
-  # A single example is rendered per operation. Prefer a 2xx response and, among
-  # those, the one with the largest body (most fields populated); fall back to
-  # the first record. Tests should record just one example per operation anyway.
+  # The success example: a single record per operation, never one flagged
+  # `response_only`. Prefer a 2xx response and, among those, the one with the
+  # largest body (most fields populated); fall back to the largest non-2xx.
   def representative_record([]), do: nil
 
   def representative_record(records) do
-    successes = Enum.filter(records, fn record -> record.status in 200..299 end)
-    candidates = if successes == [], do: records, else: successes
-    Enum.max_by(candidates, fn record -> byte_size(record.resp_body || "") end)
+    candidates = Enum.reject(records, &response_only?/1)
+    successes = Enum.filter(candidates, fn record -> record.status in 200..299 end)
+    candidates = if successes == [], do: candidates, else: successes
+
+    case candidates do
+      [] -> nil
+      list -> Enum.max_by(list, fn record -> byte_size(record.resp_body || "") end)
+    end
+  end
+
+  # Error examples: every record explicitly flagged `response_only: true` via
+  # `doc(..., response_only: true)`, rendered response-only after the success
+  # example. Sorted by source line so the order is deterministic.
+  defp error_records(records) do
+    records
+    |> Enum.filter(&response_only?/1)
+    |> Enum.sort_by(fn record -> record.assigns[:bureaucrat_line] || 0 end)
+  end
+
+  defp response_only?(record) do
+    record.assigns
+    |> Map.get(:bureaucrat_opts, [])
+    |> Keyword.get(:response_only, false)
   end
 
   @doc """
@@ -540,18 +564,22 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
       end
 
     plaintext = Keyword.get(config(), :plaintext, true)
-    # Request with path and headers
-    if plaintext do
+    response_only = response_only?(record)
+
+    # Header (the doc description) always renders above the example.
+    puts(file, "> #{record.assigns.bureaucrat_desc}\n")
+
+    # Request with path and headers — omitted for response-only examples.
+    if plaintext and not response_only do
       file
-      |> puts("> #{record.assigns.bureaucrat_desc}\n")
       |> puts("```plaintext")
       |> puts("#{record.method} #{path}")
       |> write_headers(record.req_headers)
       |> puts("```\n")
     end
 
-    # Request Body if applicable
-    unless record.body_params == %{} do
+    # Request Body if applicable — omitted for response-only examples.
+    unless response_only or record.body_params == %{} do
       file
       |> puts("```json")
       |> puts("#{JSON.encode!(deep_sort_json(record.body_params), pretty: true)}")
