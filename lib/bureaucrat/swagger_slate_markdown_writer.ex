@@ -31,7 +31,6 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     file
     |> write_overview(swagger)
     |> write_intro(path)
-    |> write_authentication(swagger)
     |> write_endpoints(records, swagger)
     |> write_models(swagger)
     |> write_change_logs(path)
@@ -143,30 +142,6 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
       _ -> nil
     end
   end
-
-  @doc """
-  Writes the authentication details to the given file.
-
-  This corresponds to the securityDefinitions section of the swagger document.
-  """
-  def write_authentication(file, %{"security" => security} = swagger) do
-    file
-    |> puts("# Authentication\n")
-
-    # TODO: Document token based security
-    Enum.each(security, fn securityRequirement ->
-      name = Map.keys(securityRequirement) |> List.first()
-      definition = swagger["securityDefinitions"][name]
-
-      file
-      |> puts("## #{definition["type"]}\n")
-      |> puts("#{definition["description"]}\n")
-    end)
-
-    file
-  end
-
-  def write_authentication(file, _), do: file
 
   @doc """
   Writes the API request/response model schemas to the given file.
@@ -456,6 +431,8 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   """
   def write_parameters(file, swagger, _ = %{"parameters" => params})
       when length(params) > 0 or map_size(params) > 0 do
+    params = Enum.flat_map(params, &expand_body_param(swagger, &1))
+
     file
     |> puts("#### Parameters\n")
     |> puts("| Parameter   | Description | In |Type      | Required | Default | Example |")
@@ -483,6 +460,42 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
 
   def write_parameters(file, _swagger, _), do: file
 
+  # A body param wraps the whole request in one swagger param (named `payload`),
+  # but no such field exists on the wire. Show the body schema's top-level
+  # fields as the parameters instead.
+  defp expand_body_param(swagger, %{"in" => "body", "schema" => schema} = param) do
+    {definition, _type} = resolve_type(swagger, schema)
+    properties = Map.get(definition || %{}, "properties", %{})
+
+    if properties == %{} do
+      [param]
+    else
+      Enum.map(properties, fn {name, property_details} ->
+        {resolved_details, type} = resolve_type(swagger, property_details)
+
+        resolved_details
+        |> Map.merge(%{
+          "name" => name,
+          "in" => "body",
+          "type" => body_field_type(type, resolved_details),
+          "required" => is_required(name, definition)
+        })
+      end)
+    end
+  end
+
+  defp expand_body_param(_swagger, param), do: [param]
+
+  defp body_field_type("array", details) do
+    case details["items"] do
+      %{"$ref" => ref} -> "array(#{schema_ref_to_link(ref)})"
+      %{"type" => type} -> "array(#{type})"
+      _ -> "array(any)"
+    end
+  end
+
+  defp body_field_type(type, _details), do: type
+
   def resolve_schema_type(swagger, %{"schema" => schema} = param) do
     {_def, type} = resolve_type(swagger, schema)
     Map.put(param, "type", type)
@@ -500,8 +513,10 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   # (see the public API swagger schemas). Render those as a real HTML `<ul>` list
   # so they display as bullets instead of one run-on line; a table cell can't hold
   # Markdown list syntax, so raw HTML is the only option. Text before the first
-  # bullet (intro) is emitted as-is before the list. Any `<br>` separators around
-  # the bullets are dropped — the list markup provides the line breaks.
+  # bullet (intro) is emitted before the list. A bullet item ends at its first
+  # newline, so text on the lines after the last bullet is emitted after the list,
+  # not inside the last item. Any `<br>` separators around the bullets are
+  # dropped — the list markup provides the line breaks.
   defp format_description(nil), do: ""
 
   defp format_description(description) do
@@ -511,12 +526,28 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
         |> String.replace("<br>", "")
         |> String.split("•")
 
-      list = Enum.map_join(items, &"<li>#{String.trim(&1)}</li>")
+      {front, [last]} = Enum.split(items, -1)
 
-      "#{String.trim_trailing(intro)}<ul>#{list}</ul>"
+      {last, trailing} =
+        case String.split(last, "\n", parts: 2) do
+          [item] -> {item, ""}
+          [item, rest] -> {item, rest |> flatten_newlines() |> String.trim()}
+        end
+
+      list = Enum.map_join(front ++ [last], &"<li>#{&1 |> flatten_newlines() |> String.trim()}</li>")
+
+      "#{intro |> flatten_newlines() |> String.trim_trailing()}<ul>#{list}</ul>#{trailing}"
     else
-      description
+      flatten_newlines(description)
     end
+  end
+
+  # A markdown table row must be a single line, so a cell can't hold raw newlines:
+  # render paragraph breaks as <br> and collapse remaining newlines to spaces.
+  defp flatten_newlines(text) do
+    text
+    |> String.replace(~r/\n{2,}/, "<br>")
+    |> String.replace("\n", " ")
   end
 
   # Render a field's allowed enum values as inline badges under its description.
