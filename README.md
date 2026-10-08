@@ -83,6 +83,7 @@ Then, to generate the documentation file(s) run `DOC=1 mix test`.
 The default output file is `API.md` in the project root.
 
 ### Pipe `|> doc()` automatically
+
 If you don't want to call `|> doc()` on each request, you can import `Bureaucrat.Macros`.
 
 - It automatically adds `|> doc()` to the `Phoenix.ConnTest` macros
@@ -113,7 +114,17 @@ named like the output file with a `_intro` or `_INTRO` suffix (before `.md`, if 
 - `web/controllers/README` -> `web/controllers/README_INTRO`
 - `web/controllers/readme.md` -> `web/controllers/readme_intro.md`
 
-Currently the supported writers are the default `Bureaucrat.MarkdownWriter` and `Bureaucrat.ApiBlueprintWriter`.
+Currently the supported writers are the default `Bureaucrat.MarkdownWriter` `Bureaucrat.ApiBlueprintWriter` and `Bureaucrat.SwaggerSlateMarkdownWriter`.
+
+### Custom change logs sections
+
+To add a custom change logs section, for each output file, bureaucrat will look for a **change logs markdown file** in the output directory,
+named like the output file with a `_change_logs` or `_CHANGE_LOGS` suffix (before `.md`, if present), e.g.
+
+- `web/controllers/README` -> `web/controllers/README_CHANGE_LOGS`
+- `web/controllers/readme.md` -> `web/controllers/readme_change_logs.md`
+
+Currently the supported writers are the default `Bureaucrat.SwaggerSlateMarkdownWriter`.
 
 ## Documenting Phoenix Channels
 

@@ -30,15 +30,10 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
 
     file
     |> write_overview(swagger)
-    |> write_authentication(swagger)
+    |> write_intro(path)
+    |> write_endpoints(records, swagger)
     |> write_models(swagger)
-
-    records
-    |> tag_records(swagger)
-    |> group_records()
-    |> Enum.each(fn {tag, records_by_operation_id} ->
-      write_operations_for_tag(file, tag, records_by_operation_id, swagger)
-    end)
+    |> write_change_logs(path)
   end
 
   @doc """
@@ -64,28 +59,89 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   end
 
   @doc """
-  Writes the authentication details to the given file.
-
-  This corresponds to the securityDefinitions section of the swagger document.
+  Writes any information included in an intro file at the top of the output
+  document.
   """
-  def write_authentication(file, %{"security" => security} = swagger) do
-    file
-    |> puts("# Authentication\n")
+  def write_intro(file, path) do
+    intro_file_path =
+      [
+        # /path/to/API.md -> /path/to/API_INTRO.md
+        String.replace(path, ~r/\.md$/i, "_INTRO\\0"),
+        # /path/to/api.md -> /path/to/api_intro.md
+        String.replace(path, ~r/\.md$/i, "_intro\\0"),
+        # /path/to/API -> /path/to/API_INTRO
+        "#{path}_INTRO",
+        # /path/to/api -> /path/to/api_intro
+        "#{path}_intro"
+      ]
+      # which one exists?
+      |> Enum.find(nil, &File.exists?/1)
 
-    # TODO: Document token based security
-    Enum.each(security, fn securityRequirement ->
-      name = Map.keys(securityRequirement) |> List.first()
-      definition = swagger["securityDefinitions"][name]
-
+    if intro_file_path do
       file
-      |> puts("## #{definition["type"]}\n")
-      |> puts("#{definition["description"]}\n")
-    end)
-
-    file
+      |> puts(File.read!(intro_file_path))
+    else
+      file
+    end
   end
 
-  def write_authentication(file, _), do: file
+  def write_change_logs(file, path) do
+    change_log_file_path =
+      [
+        # /path/to/API.md -> /path/to/API_CHANGE_LOGS.md
+        String.replace(path, ~r/\.md$/i, "_CHANGE_LOGS\\0"),
+        # /path/to/api.md -> /path/to/api_CHANGE_LOGS.md
+        String.replace(path, ~r/\.md$/i, "_change_logs\\0"),
+        # /path/to/API -> /path/to/API_CHANGE_LOGS
+        "#{path}_CHANGE_LOGS",
+        # /path/to/api -> /path/to/api_CHANGE_LOGS
+        "#{path}_change_logs"
+      ]
+      # which one exists?
+      |> Enum.find(nil, &File.exists?/1)
+
+    if change_log_file_path do
+      file
+      |> puts("""
+
+      # Changelog
+      """)
+      |> puts(sort_change_logs(File.read!(change_log_file_path)))
+    else
+      file
+    end
+  end
+
+  @doc """
+  Sorts changelog entries by date descending so the newest changes appear first.
+
+  Each entry is a `## <date>` section. Entries whose heading isn't an ISO-8601
+  date keep their relative order and are appended after the dated ones.
+  """
+  def sort_change_logs(content) do
+    {dated, undated} =
+      content
+      |> String.split(~r/^(?=## )/m, trim: true)
+      |> Enum.map(fn section -> {change_log_date(section), String.trim_trailing(section)} end)
+      |> Enum.split_with(fn {date, _section} -> date != nil end)
+
+    dated_sections =
+      dated
+      |> Enum.sort_by(fn {date, _section} -> date end, {:desc, Date})
+      |> Enum.map(fn {_date, section} -> section end)
+
+    (dated_sections ++ Enum.map(undated, fn {_date, section} -> section end))
+    |> Enum.join("\n\n")
+  end
+
+  defp change_log_date(section) do
+    with [_, heading] <- Regex.run(~r/^##\s+(\S+)/, section),
+         {:ok, date} <- Date.from_iso8601(heading) do
+      date
+    else
+      _ -> nil
+    end
+  end
 
   @doc """
   Writes the API request/response model schemas to the given file.
@@ -97,7 +153,9 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   def write_models(file, swagger) do
     puts(file, "# Models\n")
 
-    Enum.each(swagger["definitions"], fn definition ->
+    swagger["definitions"]
+    |> Enum.sort_by(fn {name, _schema} -> name end)
+    |> Enum.each(fn definition ->
       write_model(file, swagger, definition)
     end)
 
@@ -107,31 +165,24 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   @doc """
   Writes a single API model schema to the given file.
 
-  Most of the work is delegated to the write_model_properties/3 recurive function.
-  The example json is output before the table just so slate will align them.
+  Most of the work is delegated to the write_model_properties/3 recursive function.
+  A unique `model-<name>` anchor is emitted as an empty block-level `<div id>`
+  just before the heading so in-doc links resolve to the model rather than to the
+  identically named Endpoints section (Slate slugifies both `## <Name>` headings
+  to the same id, and the first one wins). A block `<div>` is used (not an inline
+  `<a>`): Redcarpet merges an inline anchor into the following heading, and the
+  Slate TOC helper then clones that heading's inner-HTML into the nav, producing a
+  duplicate anchor whose nav copy hijacks the link.
   """
   def write_model(file, swagger, {name, model_schema}) do
     file
+    |> puts(~s(<div id="#{model_anchor(name)}"></div>\n))
     |> puts("## #{name}\n")
-    |> puts("#{model_schema["description"]}")
-    |> write_model_example(model_schema)
+    |> puts("#{model_schema["description"]}\n")
     |> puts("|Property|Description|Type|Required|")
     |> puts("|--------|-----------|----|--------|")
     |> write_model_properties(swagger, model_schema)
     |> puts("")
-  end
-
-  def write_model_example(file, %{"example" => example}) do
-    json = JSON.encode!(example, pretty: true)
-
-    file
-    |> puts("\n```json")
-    |> puts(json)
-    |> puts("```\n")
-  end
-
-  def write_model_example(file, _) do
-    puts(file, "")
   end
 
   @doc """
@@ -140,24 +191,32 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   prefix is output before each property name to enable nested objects to be flattened.
   """
   def write_model_properties(file, swagger, model_schema, prefix \\ "") do
-    {objects, primitives} =
-      model_schema["properties"]
-      |> Enum.split_with(fn {_key, schema} -> schema["type"] == "object" end)
-
-    ordered = Enum.concat(primitives, objects)
+    ordered =
+      Map.get(model_schema, "properties", [])
+      |> Enum.sort_by(fn {key, _schema} -> key end)
 
     Enum.each(ordered, fn {property, property_details} ->
       {property_details, type} = resolve_type(swagger, property_details)
       required? = is_required(property, model_schema)
-      write_model_property(file, swagger, "#{prefix}#{property}", property_details, type, required?)
+
+      write_model_property(
+        file,
+        swagger,
+        "#{prefix}#{property}",
+        property_details,
+        type,
+        required?
+      )
     end)
 
     file
   end
 
-  def resolve_type(swagger, %{"$ref" => schema_ref}) do
+  # The field's own description says what it holds in this model; the referenced model's
+  # says what that model is in general, so the field's wins when it has one.
+  def resolve_type(swagger, %{"$ref" => schema_ref} = field) do
     schema_name = String.replace_prefix(schema_ref, "#/definitions/", "")
-    property_details = swagger["definitions"][schema_name]
+    property_details = Map.merge(swagger["definitions"][schema_name], Map.take(field, ["description"]))
     type = schema_ref_to_link(schema_ref)
     {property_details, type}
   end
@@ -166,8 +225,14 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     {property_details, property_details["type"]}
   end
 
-  def write_model_property(file, swagger, property, property_details, "object", _required?) do
+  def write_model_property(file, swagger, property, %{"properties" => _} = property_details, "object", _required?) do
     write_model_properties(file, swagger, property_details, "#{property}.")
+  end
+
+  # A map (`additionalProperties`) or a free-form object has no fields to flatten, so it is
+  # one row of its own rather than none.
+  def write_model_property(file, _swagger, property, property_details, "object", required?) do
+    write_property_row(file, property, property_details, object_type(property_details), required?)
   end
 
   def write_model_property(file, swagger, property, property_details, "array", required?) do
@@ -175,21 +240,40 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
 
     # TODO: handle arrays with inline schema
     schema_ref = if schema != nil, do: schema["$ref"], else: nil
-    type = if schema_ref != nil, do: "array(#{schema_ref_to_link(schema_ref)})", else: "array(any)"
+
+    type =
+      if schema_ref != nil, do: "array(#{schema_ref_to_link(schema_ref)})", else: "array(any)"
+
     write_model_property(file, swagger, property, property_details, type, required?)
   end
 
   def write_model_property(file, _swagger, property, property_details, type, required?) do
-    puts(file, "|#{property}|#{property_details["description"]}|#{type}|#{required?}|")
+    write_property_row(file, property, property_details, type, required?)
   end
+
+  defp write_property_row(file, property, property_details, type, required?) do
+    description = "#{format_description(property_details["description"])}#{enum_badges(property_details)}"
+    puts(file, "|#{property}|#{description}|#{type}|#{required?}|")
+  end
+
+  defp object_type(%{"additionalProperties" => %{"type" => "array", "items" => %{"$ref" => ref}}}),
+    do: "object(array(#{schema_ref_to_link(ref)}))"
+
+  defp object_type(%{"additionalProperties" => %{"$ref" => ref}}), do: "object(#{schema_ref_to_link(ref)})"
+  defp object_type(_property_details), do: "object"
 
   defp is_required(property, %{"required" => required}), do: property in required
   defp is_required(_property, _schema), do: false
 
   # Convert a schema reference eg, #/definitions/User to a markdown link
   def schema_ref_to_link("#/definitions/" <> type) do
-    "[#{type}](##{String.downcase(type)})"
+    "[#{type}](##{model_anchor(type)})"
   end
+
+  # Anchor for a model's Models-section heading. Kept unique (prefixed with
+  # `model-`) so links don't resolve to a same-named Endpoints section heading,
+  # which Slate would otherwise slugify to the same id and win.
+  def model_anchor(name), do: "model-#{String.downcase(name)}"
 
   @doc """
   Populate each test record with private.swagger_tag and private.operation_id from swagger.
@@ -214,53 +298,122 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     Conn.put_private(conn, :swagger_tag, tags_by_operation_id[operation_id])
   end
 
-  @doc """
-  Group a list of tagged records, first by tag, then by operation_id.
-  """
-  def group_records(records) do
-    by_tag = Enum.group_by(records, & &1.private.swagger_tag)
+  # Report operations are pulled out of their individual swagger tags and
+  # consolidated under a single "Reports" menu section.
+  @reports_path_prefix "/public/v1/reports/"
+  @reports_section "Reports"
 
-    Enum.map(by_tag, fn {tag, records_with_tag} ->
-      by_operation_id = Enum.group_by(records_with_tag, & &1.assigns.bureaucrat_opts[:operation_id])
-      {tag, by_operation_id}
+  @doc """
+  Writes every API operation under a single top-level "Endpoints" section.
+
+  Operations are grouped into menu sections (the swagger tag, or "Reports" for
+  report endpoints), then rendered as `## Section` (h2) with each operation as
+  `### Summary` (h3). Sections and operations are sorted alphabetically so the
+  generated Slate navigation is alphabetical.
+  """
+  def write_endpoints(file, records, swagger) do
+    puts(file, "# Endpoints\n")
+
+    records
+    |> tag_records(swagger)
+    |> group_into_sections(swagger)
+    |> Enum.each(fn {section, operations} ->
+      puts(file, "## #{section}\n")
+
+      Enum.each(operations, fn {details, operation_records} ->
+        write_action(file, details, operation_records, swagger)
+      end)
     end)
+
+    file
   end
 
   @doc """
-  Writes the API details and exampels for operations having the given tag.
+  Groups tagged records into alphabetically sorted menu sections.
 
-  tag roughly corresponds to a phoenix controller, eg "Users"
-  records_by_operation_id are the examples collected during tests, grouped by operationId (Controller.action)
+  Returns `[{section, operations}]` sorted by section, where operations is
+  `[{operation_details, records}]` sorted by summary. Report endpoints are
+  collected under the "Reports" section regardless of their swagger tag.
   """
-  def write_operations_for_tag(file, tag, records_by_operation_id, swagger) do
-    tag_details = swagger["tags"] |> Enum.find(&(&1["name"] == tag))
-
-    file
-    |> puts("# #{tag}\n")
-    |> puts("#{tag_details["description"]}\n")
-
-    Enum.each(records_by_operation_id, fn {operation_id, records} ->
-      write_action(file, operation_id, records, swagger)
+  def group_into_sections(records, swagger) do
+    records
+    |> Enum.group_by(& &1.assigns.bureaucrat_opts[:operation_id])
+    |> Enum.map(fn {operation_id, operation_records} ->
+      details = find_operation_by_id(swagger, operation_id)
+      {section_for(details, operation_records), details, operation_records}
     end)
+    |> Enum.group_by(fn {section, _details, _records} -> section end)
+    |> Enum.map(fn {section, operations} ->
+      sorted =
+        operations
+        |> Enum.map(fn {_section, details, records} -> {details, records} end)
+        |> Enum.sort_by(fn {details, _records} -> details["summary"] end)
 
-    file
+      {section, sorted}
+    end)
+    |> Enum.sort_by(fn {section, _operations} -> section end)
+  end
+
+  defp section_for(details, records) do
+    if String.starts_with?(to_string(details["path"]), @reports_path_prefix) do
+      @reports_section
+    else
+      List.first(records).private.swagger_tag
+    end
   end
 
   @doc """
   Writes all examples of a given operation (Controller action) to file.
   """
-  def write_action(file, operation_id, records, swagger) do
-    details = find_operation_by_id(swagger, operation_id)
-    puts(file, "## #{details["summary"]}\n")
+  def write_action(file, details, records, swagger) do
+    puts(file, "### #{details["summary"]}\n")
 
-    # write examples before params/schemas to get correct alignment in slate
-    Enum.each(records, &write_example(file, &1))
+    # write the example(s) before params/schemas to get correct alignment in slate.
+    # One success example (request + response), then each `response_only` error
+    # example (response only), in source order.
+    case representative_record(records) do
+      nil -> file
+      record -> write_example(file, record)
+    end
+
+    Enum.each(error_records(records), &write_example(file, &1))
 
     file
     |> puts("#{details["description"]}\n")
     |> write_request(details)
     |> write_parameters(swagger, details)
     |> write_responses(details)
+  end
+
+  # The success example: a single record per operation, never one flagged
+  # `response_only`. Prefer a 2xx response and, among those, the one with the
+  # largest body (most fields populated); fall back to the largest non-2xx.
+  def representative_record([]), do: nil
+
+  def representative_record(records) do
+    candidates = Enum.reject(records, &response_only?/1)
+    successes = Enum.filter(candidates, fn record -> record.status in 200..299 end)
+    candidates = if successes == [], do: candidates, else: successes
+
+    case candidates do
+      [] -> nil
+      list -> Enum.max_by(list, fn record -> byte_size(record.resp_body || "") end)
+    end
+  end
+
+  # Error examples: every record explicitly flagged `response_only: true` via
+  # `doc(..., response_only: true)`, rendered response-only after the success
+  # example. Sorted by source line so the order is deterministic.
+  defp error_records(records) do
+    records
+    |> Enum.filter(&response_only?/1)
+    |> Enum.sort_by(fn record -> record.assigns[:bureaucrat_line] || 0 end)
+  end
+
+  defp response_only?(record) do
+    record.assigns
+    |> Map.get(:bureaucrat_opts, [])
+    |> Keyword.get(:response_only, false)
   end
 
   @doc """
@@ -284,7 +437,7 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   """
   def write_request(file, %{"action" => action, "path" => path}) do
     file
-    |> puts("### Request\n")
+    |> puts("#### Request\n")
     |> puts("`#{String.upcase(action)} #{path}`")
   end
 
@@ -294,14 +447,22 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   Uses the vendor extension "x-example" to provide example of each parameter.
   TODO: detailed schema validation rules aren't shown yet (min/max/regex/etc...)
   """
-  def write_parameters(file, swagger, _ = %{"parameters" => params}) when length(params) > 0 or map_size(params) > 0 do
+  def write_parameters(file, swagger, _ = %{"parameters" => params})
+      when length(params) > 0 or map_size(params) > 0 do
+    params = Enum.flat_map(params, &expand_body_param(swagger, &1))
+
     file
-    |> puts("### Parameters\n")
+    |> puts("#### Parameters\n")
     |> puts("| Parameter   | Description | In |Type      | Required | Default | Example |")
     |> puts("|-------------|-------------|----|----------|----------|---------|---------|")
 
-    Enum.each(params, fn param ->
-      enriched_param = resolve_schema_type(swagger, param)
+    Enum.each(Enum.sort_by(params, & &1["name"]), fn param ->
+      badges = enum_badges(param)
+
+      enriched_param =
+        swagger
+        |> resolve_schema_type(param)
+        |> Map.update("description", badges, &"#{format_description(&1)}#{badges}")
 
       content =
         ["name", "description", "in", "type", "required", "default", "x-example"]
@@ -317,6 +478,42 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
 
   def write_parameters(file, _swagger, _), do: file
 
+  # A body param wraps the whole request in one swagger param (named `payload`),
+  # but no such field exists on the wire. Show the body schema's top-level
+  # fields as the parameters instead.
+  defp expand_body_param(swagger, %{"in" => "body", "schema" => schema} = param) do
+    {definition, _type} = resolve_type(swagger, schema)
+    properties = Map.get(definition || %{}, "properties", %{})
+
+    if properties == %{} do
+      [param]
+    else
+      Enum.map(properties, fn {name, property_details} ->
+        {resolved_details, type} = resolve_type(swagger, property_details)
+
+        resolved_details
+        |> Map.merge(%{
+          "name" => name,
+          "in" => "body",
+          "type" => body_field_type(type, resolved_details),
+          "required" => is_required(name, definition)
+        })
+      end)
+    end
+  end
+
+  defp expand_body_param(_swagger, param), do: [param]
+
+  defp body_field_type("array", details) do
+    case details["items"] do
+      %{"$ref" => ref} -> "array(#{schema_ref_to_link(ref)})"
+      %{"type" => type} -> "array(#{type})"
+      _ -> "array(any)"
+    end
+  end
+
+  defp body_field_type(type, _details), do: type
+
   def resolve_schema_type(swagger, %{"schema" => schema} = param) do
     {_def, type} = resolve_type(swagger, schema)
     Map.put(param, "type", type)
@@ -325,8 +522,65 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   def resolve_schema_type(_swagger, param), do: param
 
   # Encode parameter table cell values as strings, using json library to convert lists/maps
-  defp encode_parameter_table_cell(param) when is_map(param) or is_list(param), do: JSON.encode!(param)
+  defp encode_parameter_table_cell(param) when is_map(param) or is_list(param),
+    do: JSON.encode!(param)
+
   defp encode_parameter_table_cell(param), do: to_string(param)
+
+  # A description may enumerate allowed values as bullets, each prefixed with "• "
+  # (see the public API swagger schemas). Render those as a real HTML `<ul>` list
+  # so they display as bullets instead of one run-on line; a table cell can't hold
+  # Markdown list syntax, so raw HTML is the only option. Text before the first
+  # bullet (intro) is emitted before the list. A bullet item ends at its first
+  # newline, so text on the lines after the last bullet is emitted after the list,
+  # not inside the last item. Any `<br>` separators around the bullets are
+  # dropped — the list markup provides the line breaks.
+  defp format_description(nil), do: ""
+
+  defp format_description(description) do
+    if String.contains?(description, "•") do
+      [intro | items] =
+        description
+        |> String.replace("<br>", "")
+        |> String.split("•")
+
+      {front, [last]} = Enum.split(items, -1)
+
+      {last, trailing} =
+        case String.split(last, "\n", parts: 2) do
+          [item] -> {item, ""}
+          [item, rest] -> {item, rest |> flatten_newlines() |> String.trim()}
+        end
+
+      list = Enum.map_join(front ++ [last], &"<li>#{&1 |> flatten_newlines() |> String.trim()}</li>")
+
+      "#{intro |> flatten_newlines() |> String.trim_trailing()}<ul>#{list}</ul>#{trailing}"
+    else
+      flatten_newlines(description)
+    end
+  end
+
+  # A markdown table row must be a single line, so a cell can't hold raw newlines:
+  # render paragraph breaks as <br> and collapse remaining newlines to spaces.
+  defp flatten_newlines(text) do
+    text
+    |> String.replace(~r/\n{2,}/, "<br>")
+    |> String.replace("\n", " ")
+  end
+
+  # Render a field's allowed enum values as inline badges under its description.
+  # Enum values live directly on the field (query params, model properties), on its
+  # array `items` (array fields), or on its `schema` (body params).
+  defp enum_badges(details) do
+    values =
+      details["enum"] || get_in(details, ["items", "enum"]) ||
+        get_in(details, ["schema", "enum"]) || get_in(details, ["schema", "items", "enum"])
+
+    case values do
+      nil -> ""
+      values -> "<br>" <> Enum.map_join(values, " ", &~s(<span class="enum-badge">#{&1}</span>))
+    end
+  end
 
   @doc """
   Writes the responses table for given swagger operation to file.
@@ -337,7 +591,7 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   """
   def write_responses(file, swagger_operation) do
     file
-    |> puts("### Responses\n")
+    |> puts("#### Responses\n")
     |> puts("| Status | Description | Schema |")
     |> puts("|--------|-------------|--------|")
 
@@ -359,21 +613,25 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
       end
 
     plaintext = Keyword.get(config(), :plaintext, true)
-    # Request with path and headers
-    if plaintext do
+    response_only = response_only?(record)
+
+    # Header (the doc description) always renders above the example.
+    puts(file, "> #{record.assigns.bureaucrat_desc}\n")
+
+    # Request with path and headers — omitted for response-only examples.
+    if plaintext and not response_only do
       file
-      |> puts("> #{record.assigns.bureaucrat_desc}\n")
       |> puts("```plaintext")
       |> puts("#{record.method} #{path}")
       |> write_headers(record.req_headers)
       |> puts("```\n")
     end
 
-    # Request Body if applicable
-    unless record.body_params == %{} do
+    # Request Body if applicable — omitted for response-only examples.
+    unless response_only or record.body_params == %{} do
       file
       |> puts("```json")
-      |> puts("#{JSON.encode!(record.body_params, pretty: true)}")
+      |> puts("#{JSON.encode!(deep_sort_json(record.body_params), pretty: true)}")
       |> puts("```\n")
     end
 
@@ -413,9 +671,30 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   def format_resp_body(string) do
     case string do
       "" -> ""
-      _ -> string |> JSON.decode!() |> JSON.encode!(pretty: true)
+      _ -> string |> JSON.decode!() |> deep_sort_json() |> JSON.encode!(pretty: true)
     end
   end
+
+  @doc """
+  Recursively sorts object keys so rendered JSON examples are alphabetical.
+
+  Maps become `Jason.OrderedObject`s (the configured JSON library is Jason) to
+  preserve key order through encoding; lists are mapped element-wise.
+  """
+  # Only plain JSON objects get key-sorted. Structs (e.g. Plug.Upload in a
+  # file-upload body) pass through untouched so their own Jason encoder is used,
+  # matching how the body was encoded before sorting was introduced.
+  def deep_sort_json(%_{} = struct), do: struct
+
+  def deep_sort_json(map) when is_map(map) do
+    map
+    |> Enum.sort_by(fn {key, _value} -> to_string(key) end)
+    |> Enum.map(fn {key, value} -> {key, deep_sort_json(value)} end)
+    |> Jason.OrderedObject.new()
+  end
+
+  def deep_sort_json(list) when is_list(list), do: Enum.map(list, &deep_sort_json/1)
+  def deep_sort_json(value), do: value
 
   defp config, do: Application.get_env(:bureaucrat, :writer_opts, [])
 end
