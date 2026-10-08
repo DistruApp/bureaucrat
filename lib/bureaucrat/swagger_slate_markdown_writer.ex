@@ -212,9 +212,11 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     file
   end
 
-  def resolve_type(swagger, %{"$ref" => schema_ref}) do
+  # The field's own description says what it holds in this model; the referenced model's
+  # says what that model is in general, so the field's wins when it has one.
+  def resolve_type(swagger, %{"$ref" => schema_ref} = field) do
     schema_name = String.replace_prefix(schema_ref, "#/definitions/", "")
-    property_details = swagger["definitions"][schema_name]
+    property_details = Map.merge(swagger["definitions"][schema_name], Map.take(field, ["description"]))
     type = schema_ref_to_link(schema_ref)
     {property_details, type}
   end
@@ -223,8 +225,14 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
     {property_details, property_details["type"]}
   end
 
-  def write_model_property(file, swagger, property, property_details, "object", _required?) do
+  def write_model_property(file, swagger, property, %{"properties" => _} = property_details, "object", _required?) do
     write_model_properties(file, swagger, property_details, "#{property}.")
+  end
+
+  # A map (`additionalProperties`) or a free-form object has no fields to flatten, so it is
+  # one row of its own rather than none.
+  def write_model_property(file, _swagger, property, property_details, "object", required?) do
+    write_property_row(file, property, property_details, object_type(property_details), required?)
   end
 
   def write_model_property(file, swagger, property, property_details, "array", required?) do
@@ -240,9 +248,19 @@ defmodule Bureaucrat.SwaggerSlateMarkdownWriter do
   end
 
   def write_model_property(file, _swagger, property, property_details, type, required?) do
+    write_property_row(file, property, property_details, type, required?)
+  end
+
+  defp write_property_row(file, property, property_details, type, required?) do
     description = "#{format_description(property_details["description"])}#{enum_badges(property_details)}"
     puts(file, "|#{property}|#{description}|#{type}|#{required?}|")
   end
+
+  defp object_type(%{"additionalProperties" => %{"type" => "array", "items" => %{"$ref" => ref}}}),
+    do: "object(array(#{schema_ref_to_link(ref)}))"
+
+  defp object_type(%{"additionalProperties" => %{"$ref" => ref}}), do: "object(#{schema_ref_to_link(ref)})"
+  defp object_type(_property_details), do: "object"
 
   defp is_required(property, %{"required" => required}), do: property in required
   defp is_required(_property, _schema), do: false
